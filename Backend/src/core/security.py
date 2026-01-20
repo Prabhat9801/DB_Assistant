@@ -185,7 +185,12 @@ class HardcodedSecurityValidator:
         # ============================================================
         # LAYER 3.2: WHITELIST CHECK (SELECT ONLY)
         # ============================================================
-        if not sql_lower.startswith("select"):
+        # Allow SELECT and WITH (CTEs - Common Table Expressions)
+        # CTEs are read-only and start with "WITH ... AS (...) SELECT"
+        is_select = sql_lower.startswith("select")
+        is_cte = sql_lower.startswith("with") and "select" in sql_lower
+        
+        if not (is_select or is_cte):
             return SecurityValidationResult(
                 is_valid=False,
                 error_message="Only SELECT queries are allowed. This is a read-only system.",
