@@ -298,7 +298,9 @@ class ChatService:
         
         hinglish_patterns = [
             r'\bkitne\b', r'\bdikhao\b', r'\bbatao\b', r'\bsabhi\b',
-            r'\bwale\b', r'\bwali\b', r'\bmein\b', r'\bko\b'
+            r'\bwale\b', r'\bwali\b', r'\bmein\b', r'\bko\b',
+            r'\bjo\b', r'\bnhi\b', r'\bnahi\b', r'\bkiya\b', r'\bh\b',
+            r'\bka\b', r'\bke\b', r'\bkb\b', r'\bkab\b', r'\bkha\b'
         ]
         pattern_matches = sum(1 for p in hinglish_patterns if re.search(p, question))
         
@@ -336,6 +338,44 @@ class ChatService:
         except Exception as e:
             log_step("2️⃣ SCHEMA_FETCHER ❌", f"Error: {str(e)}")
             return {"error": f"Failed to fetch schema: {str(e)}"}
+    
+    def _get_total_count(self, sql: str) -> int:
+        """
+        Get the actual total count of records for a query (without LIMIT).
+        Converts a SELECT query to a COUNT query.
+        """
+        try:
+            # Remove existing LIMIT clause if present
+            sql_clean = re.sub(r'\s+LIMIT\s+\d+', '', sql, flags=re.IGNORECASE)
+            sql_clean = re.sub(r'\s+OFFSET\s+\d+', '', sql_clean, flags=re.IGNORECASE)
+            
+            # Remove ORDER BY clause (not needed for count)
+            sql_clean = re.sub(r'\s+ORDER\s+BY\s+[^;]+', '', sql_clean, flags=re.IGNORECASE)
+            
+            # Handle DISTINCT queries
+            if re.search(r'SELECT\s+DISTINCT', sql_clean, re.IGNORECASE):
+                # For DISTINCT, wrap the query
+                count_sql = f"SELECT COUNT(*) as total FROM ({sql_clean}) as subquery"
+            else:
+                # For regular SELECT, replace columns with COUNT(*)
+                # Find the FROM clause position
+                from_match = re.search(r'\bFROM\b', sql_clean, re.IGNORECASE)
+                if from_match:
+                    count_sql = f"SELECT COUNT(*) as total {sql_clean[from_match.start():]}"
+                else:
+                    # Fallback: wrap the query
+                    count_sql = f"SELECT COUNT(*) as total FROM ({sql_clean}) as subquery"
+            
+            # Execute count query
+            result = self.db_service.execute_select(count_sql)
+            if result and len(result) > 0:
+                return result[0].get('total', 0)
+            return 0
+            
+        except Exception as e:
+            print(f"⚠️ Could not get total count: {str(e)}")
+            # Return -1 to indicate count failed, will use result_count instead
+            return -1
     
     def _get_detailed_schema(self) -> str:
         """Get detailed schema information."""
@@ -568,30 +608,53 @@ For delegation.status:
   - This is TEXT, not ENUM - values like 'done', 'Done', 'extend'
 
 === ⚠️⚠️⚠️ SUPER CRITICAL: DATE HANDLING ⚠️⚠️⚠️ ===
-⚠️ checklist.planned_date is TEXT in DD/MM/YYYY format (e.g., '28/11/2025')
-⚠️ NEVER use ::timestamp directly on planned_date!
-⚠️ Use TO_TIMESTAMP() with proper format:
 
-CORRECT WAY to convert planned_date:
-  TO_TIMESTAMP(checklist.planned_date, 'DD/MM/YYYY')
+**ALWAYS CAST TIMESTAMPS TO DATE:**
+- When filtering by a specific date, ALWAYS cast the timestamp column to date:
+  ✅ CORRECT: `WHERE task_start_date::date = '2025-02-17'`
+  ✅ CORRECT: `WHERE task_start_date::date = '2026-02-17'`
+  ❌ WRONG: `WHERE task_start_date = '2025-02-17'` (Fails because it looks for 00:00:00 time)
 
-CORRECT comparison with NOW():
-  TO_TIMESTAMP(checklist.planned_date, 'DD/MM/YYYY') < NOW()
+**PREFERRED DATE COLUMNS (in order of preference):**
 
-WRONG (will cause error):
-  checklist.planned_date::timestamp < NOW()  -- ERROR!
-  checklist.planned_date < NOW()  -- ERROR!
+1. **checklist.task_start_date** (TIMESTAMP) - ✅ PRIMARY choice for task dates
+   - Use for: "tasks on date X", "tasks given on date Y", "tasks starting on Z"
+   - Example: `WHERE task_start_date::date = '2025-02-17'`
 
-For "not completed on time" queries:
-  WHERE checklist.status = 'no' 
-    AND TO_TIMESTAMP(checklist.planned_date, 'DD/MM/YYYY') < NOW()
+2. **checklist.submission_date** (TIMESTAMP) - For submission dates
+   - Use for: "tasks submitted on date X"
+   - Example: `WHERE submission_date::date = '2025-02-17'`
 
-Other date columns (these ARE proper timestamps):
-- checklist.submission_date: TIMESTAMP
-- checklist.task_start_date: TIMESTAMP  
-- checklist.created_at: TIMESTAMP
-- delegation.planned_date: TIMESTAMP (proper timestamp)
-- delegation.submission_date: TIMESTAMP
+3. **checklist.created_at** (TIMESTAMP) - For creation dates
+   - Use for: "tasks created on date X"
+   - Example: `WHERE created_at::date = '2025-02-17'`
+
+4. **delegation.planned_date** (TIMESTAMP) - For delegation dates
+   - Use for delegation table queries
+   - Example: `WHERE planned_date::date = '2025-02-17'`
+
+**SMART DATE SEARCH STRATEGY:**
+If user just says "tasks on date X" without specifying start/planned/submission:
+- Prioritize `task_start_date`
+- BUT if reasonable, check multiple columns using OR:
+  `WHERE (task_start_date::date = '2026-02-17' OR created_at::date = '2026-02-17')`
+
+**AVOID UNLESS SPECIFICALLY REQUESTED:**
+
+5. **checklist.planned_date** (TEXT) - ⚠️ PROBLEMATIC! Mixed formats!
+   - This column has inconsistent formats: DD/MM/YYYY, YYYY-MM-DD, etc.
+   - ONLY use if user explicitly says "planned date"
+   - If you must use it, handle BOTH formats as shown below.
+
+**LOGIC SAFETY CAGE:**
+- WHEN using `OR`, YOU MUST wrap the entire `OR` block in parentheses!
+- WRONG: `WHERE col1 = 'val' AND date = 'd1' OR date = 'd2'` (This breaks the col1 filter!)
+- RIGHT: `WHERE col1 = 'val' AND (date = 'd1' OR date = 'd2')`
+
+**DEFAULT RULE:**
+- Unless user specifically mentions "planned date", ALWAYS use task_start_date for checklist queries
+- For date comparisons, use ::date to compare only the date part
+- For date ranges, use BETWEEN or >= and <=
 
 === JOIN LOGIC ===
 - Link users to tasks: users.user_name = checklist.name
@@ -714,7 +777,7 @@ Return ONLY the SQL statement:"""
             return {"final_answer": f"Error: {state['error']}"}
         
         if state.get("detected_language") == "hinglish":
-            language_instruction = "Respond in Hinglish (Hindi-English mix). Use Hindi words naturally."
+            language_instruction = "IMPORTANT: Respond in natural HINGLISH (Hindi written in English). Use words like 'ye rahi list', 'aap dekh sakte hain', 'tasks complete nahi hue'. Do NOT just copy English text."
         else:
             language_instruction = "Respond in English"
         
@@ -738,6 +801,10 @@ FORMATTING RULES:
 4. For aggregated counts, show them clearly with the count value
 5. Keep the response concise but complete
 6. Present ALL results - do NOT say "showing sample" or "showing X of Y"
+7. IF RESULTS ARE EMPTY (0 records):
+   - Do NOT say "User does not exist" unless you queried the users table directly.
+   - If querying tasks and count is 0, say "No tasks found for this period" or "No tasks completed".
+   - Distinguish between "No data found matching criteria" vs "Data doesn't exist".
 
 Example table format:
 | Name | Department | Count |
@@ -935,10 +1002,23 @@ Provide a well-formatted, natural language answer with ALL the data:""")
             print("📝 Step 1: Processing query...")
             
             # Default language detection (done early for all paths)
+            # Improved Language Detection (regex based)
             question_lower = question.lower()
             words = question_lower.split()
+            
+            # Count common Hindi words
             hinglish_count = sum(1 for w in words if w in self.hinglish_words)
-            detected_language = "hinglish" if hinglish_count >= 2 else "english"
+            
+            # Check for regex patterns
+            hinglish_patterns = [
+                r'\bkitne\b', r'\bdikhao\b', r'\bbatao\b', r'\bsabhi\b',
+                r'\bwale\b', r'\bwali\b', r'\bmein\b', r'\bko\b',
+                r'\bjo\b', r'\bnhi\b', r'\bnahi\b', r'\bkiya\b', r'\bh\b',
+                r'\bka\b', r'\bke\b', r'\bkb\b', r'\bkab\b', r'\bkha\b'
+            ]
+            pattern_matches = sum(1 for p in hinglish_patterns if re.search(p, question_lower))
+            
+            detected_language = "hinglish" if (hinglish_count >= 2 or pattern_matches >= 1) else "english"
             print(f"🌐 Step 2: Detected language: {detected_language}")
             
             # Check cache first
@@ -982,33 +1062,59 @@ Provide a well-formatted, natural language answer with ALL the data:""")
             
             # Security validation
             yield json_module.dumps({"type": "status", "message": "Validating query security..."}) + "\n"
+            print("\n==============================")
             print("🔒 Step 7: Validating SQL security...")
+            print(f"SQL to validate:\n{generated_sql}\n")
             is_valid, error_message, sanitized_sql = validate_sql_security(generated_sql)
-            
+            print(f"Sanitized SQL (after security):\n{sanitized_sql}\n")
             if not is_valid:
                 print(f"❌ Security validation FAILED: {error_message}")
                 yield json_module.dumps({"type": "error", "message": f"Query blocked: {error_message}"}) + "\n"
                 return
             print("✅ Security validation passed")
-            
+            print("==============================\n")
+
             # Yield the SQL
             yield json_module.dumps({"type": "sql", "value": sanitized_sql}) + "\n"
-            
+
             # Execute query
             yield json_module.dumps({"type": "status", "message": "Executing query..."}) + "\n"
+            print("\n==============================")
             print("🗄️ Step 8: Executing SQL query...")
-            
+            print(f"Main SQL (with LIMIT):\n{sanitized_sql}\n")
             try:
+                # First, get the actual total count (without LIMIT)
+                print("Generating COUNT query...")
+                actual_total_count = self._get_total_count(sanitized_sql)
+                print(f"COUNT query result: {actual_total_count}")
+
+                # Then execute the query with LIMIT (max 200 rows fetched)
+                print("Executing main query (with LIMIT 200)...")
                 results = self.db_service.execute_select(sanitized_sql)
                 result_count = len(results) if results else 0
-                print(f"✅ Query executed - {result_count} results")
+
+                # If count query failed, use result_count as fallback
+                if actual_total_count < 0:
+                    actual_total_count = result_count
+                    print(f"⚠️ Count query failed, using fetched count: {result_count}")
+                else:
+                    print(f"📊 Total records in DB: {actual_total_count}")
+
+                print(f"✅ Query executed - {result_count} results fetched (total: {actual_total_count})")
+                if result_count > 0:
+                    print(f"Sample row: {results[0]}")
+                else:
+                    print("No rows returned.")
             except Exception as e:
                 print(f"❌ Query execution FAILED: {str(e)}")
                 yield json_module.dumps({"type": "error", "message": f"Query failed: {str(e)}"}) + "\n"
                 return
-            
-            yield json_module.dumps({"type": "status", "message": f"Found {result_count} results. Generating response..."}) + "\n"
+            print("==============================\n")
+
+            yield json_module.dumps({"type": "status", "message": f"Found {actual_total_count} total results. Generating response..."}) + "\n"
             print(f"🤖 Step 9: Streaming answer from LLM...")
+            print(f"LLM Prompt will include: user question, SQL, total count, and sample results.")
+            print("==============================\n")
             
             # Check if user wants all data
             wants_all_data = any(word in question.lower() for word in [
@@ -1016,7 +1122,7 @@ Provide a well-formatted, natural language answer with ALL the data:""")
                 "sara", "sare", "total", "every", "detailed list"
             ])
             
-            # Limit results to 15 unless user asks for all
+            # Limit results to 15 unless user asks for all (but max 200 fetched)
             display_results = results
             showing_sample = False
             if result_count > 15 and not wants_all_data:
@@ -1024,18 +1130,23 @@ Provide a well-formatted, natural language answer with ALL the data:""")
                 showing_sample = True
             
             # Stream the answer generation
-            language_instruction = "Respond in Hinglish (Hindi-English mix)." if detected_language == "hinglish" else "Respond in English"
+            if detected_language == "hinglish":
+                language_instruction = "IMPORTANT: Respond in natural HINGLISH (Hindi written in English). Use words like 'ye rahi list', 'aap dekh sakte hain', 'tasks complete nahi hue'. Do NOT just copy English text."
+            else:
+                language_instruction = "Respond in English"
             
+            # Use actual_total_count for the message, not result_count
             sample_note = f"""
-IMPORTANT: The query returned {result_count} total records but only showing first 15 as a sample.
-Mention this clearly: "Total {result_count} records found. Showing 15 sample records. Ask for 'complete data' or 'all records' to see everything."
+IMPORTANT: The database has {actual_total_count} total records matching this query, but only showing first 15 as a sample.
+Mention this clearly: "Total {actual_total_count} records found in database. Showing 15 sample records. Ask for 'complete data' or 'all records' to see more."
 """ if showing_sample else ""
             
             answer_prompt = f"""You are a helpful database assistant. {language_instruction}
 
 User Question: {question}
 SQL Query Used: {sanitized_sql}
-Total Results: {result_count}
+Total Records in Database: {actual_total_count}
+Sample Results Shown: {len(display_results)}
 Query Results: {str(display_results)}
 {sample_note}
 
@@ -1046,6 +1157,10 @@ CRITICAL RESPONSE RULES:
 4. Use markdown TABLE format for data with multiple columns
 5. Use numbered lists for simple lists
 6. Be conversational and helpful
+7. IF RESULTS ARE EMPTY (0 records):
+   - Do NOT say "User does not exist" unless you queried the users table directly.
+   - If querying tasks and count is 0, say "No tasks found for this period" or "No tasks completed".
+   - Distinguish between "No data found matching criteria" vs "Data doesn't exist".
 
 BAD EXAMPLE (don't do this):
 "Yeh query yeh dikhati hai ki..." or "The SQL query shows..."

@@ -348,6 +348,28 @@ async def delete_session(session_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id} not found"
         )
+
+
+@router.post("/sessions/{session_id}/delete-empty", summary="Delete a session if it has no messages")
+async def delete_empty_session(session_id: str):
+    """
+    Delete a session only if it has no messages.
+    This endpoint is designed for cleanup when user closes the browser
+    without sending any messages. Uses POST to work with navigator.sendBeacon().
+    """
+    from src.services.session_service import session_service
+    
+    session = session_service.get_session(session_id)
+    if not session:
+        return {"deleted": False, "reason": "Session not found"}
+    
+    # Only delete if no messages
+    messages = session_service.get_session_messages(session_id, limit=1)
+    if len(messages) == 0:
+        session_service.delete_session(session_id)
+        return {"deleted": True, "reason": "Empty session deleted"}
+    
+    return {"deleted": False, "reason": "Session has messages"}
     
     return {"message": f"Session {session_id} deleted successfully"}
 

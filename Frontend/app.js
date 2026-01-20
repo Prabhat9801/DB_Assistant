@@ -46,6 +46,7 @@ let isGenerating = false;
 let currentRequestId = null;
 let abortController = null;
 let confirmResolve = null;
+let currentSessionHasMessages = false; // Track if current session has any messages
 
 // ============================================================================
 // CONFIRMATION MODAL
@@ -91,10 +92,30 @@ function closeConfirmModal(result) {
 // INITIALIZATION
 // ============================================================================
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     startTypingAnimation();
-    loadSessions();
     setupEventListeners();
+    
+    // Always create a new chat on site load
+    await createNewSession();
+    await loadSessions();
+});
+
+// Clean up empty sessions when user leaves the site
+window.addEventListener('beforeunload', () => {
+    // If current session has no messages, delete it silently
+    if (currentSessionId && !currentSessionHasMessages) {
+        // Use sendBeacon for reliable delivery even when page is closing
+        navigator.sendBeacon(`${API_BASE_URL}/chat/sessions/${currentSessionId}/delete-empty`);
+    }
+});
+
+// Also handle visibility change (when user switches tabs or minimizes)
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && currentSessionId && !currentSessionHasMessages) {
+        // Don't delete on tab switch, only track
+        // The actual deletion happens on beforeunload
+    }
 });
 
 function setupEventListeners() {
@@ -222,6 +243,9 @@ async function loadSessionMessages(sessionId) {
         const response = await fetch(`${API_BASE_URL}/chat/sessions/${sessionId}/messages`);
         const data = await response.json();
         
+        // Track if this session has messages
+        currentSessionHasMessages = data.messages.length > 0;
+        
         chatDisplay.innerHTML = '';
         
         if (data.messages.length === 0) {
@@ -248,6 +272,17 @@ async function loadSessionMessages(sessionId) {
 
 async function createNewSession() {
     try {
+        // Before creating new session, delete current if it has no messages
+        if (currentSessionId && !currentSessionHasMessages) {
+            try {
+                await fetch(`${API_BASE_URL}/chat/sessions/${currentSessionId}`, {
+                    method: 'DELETE'
+                });
+            } catch (e) {
+                // Silently ignore errors when deleting empty session
+            }
+        }
+        
         const response = await fetch(`${API_BASE_URL}/chat/sessions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -256,6 +291,7 @@ async function createNewSession() {
         
         const session = await response.json();
         currentSessionId = session.session_id;
+        currentSessionHasMessages = false; // New session has no messages
         
         await loadSessions();
         selectSession(session.session_id);
@@ -372,6 +408,9 @@ async function sendMessage() {
             return;
         }
     }
+
+    // Mark session as having messages (prevents auto-deletion on close)
+    currentSessionHasMessages = true;
 
     // Set generating state
     isGenerating = true;
