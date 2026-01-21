@@ -203,6 +203,20 @@ class QueryCacheService:
                 self.collection.update(ids=[doc_id], metadatas=[metadata])
         except Exception:
             pass
+
+    def invalidate(self, question: str) -> bool:
+        """Invalidate (delete) a specific query from cache."""
+        if not self.enabled:
+            return False
+            
+        try:
+            doc_id = self._generate_id(question)
+            print(f"🗑️ Invalidating cache for: '{question[:50]}...'")
+            self.collection.delete(ids=[doc_id])
+            return True
+        except Exception as e:
+            print(f"❌ Failed to invalidate cache: {e}")
+            return False
     
     def clear_cache(self) -> bool:
         """Clear all cached queries."""

@@ -102,14 +102,15 @@ class DatabaseService:
         """Get column information for a table."""
         sql = """
             SELECT 
-                column_name,
-                data_type,
-                is_nullable,
-                column_default,
-                udt_name
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                c.udt_name,
+                pg_catalog.col_description(format('%%s.%%s', c.table_schema, c.table_name)::regclass::oid, c.ordinal_position) as column_description
+            FROM information_schema.columns c
+            WHERE c.table_schema = %s AND c.table_name = %s
+            ORDER BY c.ordinal_position
         """
         with self.get_cursor() as cursor:
             cursor.execute(sql, (schema, table_name))

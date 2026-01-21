@@ -58,7 +58,7 @@ BLOCKED_KEYWORDS: frozenset = frozenset([
     
     # Dangerous Keywords
     "into outfile", "into dumpfile", "load_file",
-    "benchmark", "sleep", "waitfor", "delay",
+    "benchmark", "sleep", "waitfor",
     
     # Information Schema Abuse
     "information_schema", "pg_catalog", "pg_shadow", "pg_authid",

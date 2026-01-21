@@ -35,6 +35,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, END
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 # Import our modules
 from src.core.security import validate_sql_security, HardcodedSecurityValidator
@@ -137,6 +139,7 @@ class ChatState(TypedDict):
     is_blocked: bool
     cache_hit: bool
     cancelled: bool
+    chat_history: List[Dict[str, str]]
 
 
 class ChatService:
@@ -158,6 +161,10 @@ class ChatService:
         self.schema_service = SchemaService()
         self.db_service = DatabaseService()
         self.security_validator = HardcodedSecurityValidator()
+        
+        # Setup Persistence
+        self.conn = sqlite3.connect("chat_state.db", check_same_thread=False)
+        self.checkpointer = SqliteSaver(self.conn)
         
         # Hinglish indicators
         self.hinglish_words = [
@@ -264,7 +271,7 @@ class ChatService:
         workflow.add_edge("cache_result", END)
         workflow.add_edge("handle_blocked", END)
         
-        return workflow.compile()
+        return workflow.compile(checkpointer=self.checkpointer)
     
     def _check_cache(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Check if a similar query exists in cache."""
@@ -351,9 +358,16 @@ class ChatService:
             
             # Remove ORDER BY clause (not needed for count)
             sql_clean = re.sub(r'\s+ORDER\s+BY\s+[^;]+', '', sql_clean, flags=re.IGNORECASE)
+
+            # Strip trailing semicolon
+            sql_clean = sql_clean.strip().rstrip(';')
+
+            # Handle CTEs (WITH clause) - Must wrap in subquery
+            if re.search(r'^\s*WITH\b', sql_clean, re.IGNORECASE):
+                 count_sql = f"SELECT COUNT(*) as total FROM ({sql_clean}) as subquery"
             
             # Handle DISTINCT queries
-            if re.search(r'SELECT\s+DISTINCT', sql_clean, re.IGNORECASE):
+            elif re.search(r'SELECT\s+DISTINCT', sql_clean, re.IGNORECASE):
                 # For DISTINCT, wrap the query
                 count_sql = f"SELECT COUNT(*) as total FROM ({sql_clean}) as subquery"
             else:
@@ -378,36 +392,9 @@ class ChatService:
             return -1
     
     def _get_detailed_schema(self) -> str:
-        """Get detailed schema information."""
-        query = """
-        SELECT 
-            table_name, 
-            column_name, 
-            data_type,
-            is_nullable,
-            column_default
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name IN ('checklist', 'delegation', 'users')
-        ORDER BY table_name, ordinal_position;
-        """
-        
+        """Get detailed schema information using SchemaService."""
         try:
-            rows = self.db_service.execute_select(query)
-            
-            schema_map = {}
-            for row in rows:
-                table = row['table_name']
-                col_info = f"{row['column_name']} ({row['data_type']})"
-                if row['is_nullable'] == 'NO':
-                    col_info += " NOT NULL"
-                schema_map.setdefault(table, []).append(col_info)
-            
-            schema_text = ""
-            for table, cols in schema_map.items():
-                schema_text += f"Table: public.{table}\nColumns:\n  - " + "\n  - ".join(cols) + "\n\n"
-            
-            return schema_text.strip()
+            return self.schema_service.get_formatted_schema_context()
         except Exception as e:
             return f"Schema fetch error: {str(e)}"
     
@@ -525,10 +512,20 @@ Common Hinglish patterns:
 - "pending wale" = pending ones
 """
         
+
+        # Format history for context
+        history_text = ""
+        if state.get("chat_history"):
+            history_text = "Previous Conversation:\n" + "\n".join(
+                [f"{msg['role'].upper()}: {msg['content'][:200]}..." for msg in state["chat_history"][-3:]]
+            ) + "\n\n"
+
         prompt = f"""Analyze the user's question and determine:
 1. Which tables are relevant (checklist, delegation, users)
 2. Whether JOINs are needed
 3. What type of aggregation/filtering is required
+4. **CONTEXT CHECK**: If user asks for "total", "count", or refers to "that", check Previous Conversation to see what they are talking about.
+   - Example: If prev answer showed tasks for user X, and now user says "total count", they mean COUNT(tasks) for user X.
 
 CRITICAL RULE: This is READ-ONLY. No modifications allowed.
 {hinglish_context}
@@ -540,6 +537,7 @@ Available Tables:
 
 {state['sample_data_context']}
 
+{history_text}
 User Question: {state['user_question']}
 
 Respond in JSON format:
@@ -548,6 +546,14 @@ Respond in JSON format:
         
         try:
             log_step("3️⃣ INTENT_ANALYZER", "Sending prompt to LLM...")
+
+            if VERBOSE_MODE:
+                print("\n" + "="*60)
+                print("📜 DEBUG: INTENT ANALYZER PROMPT")
+                print("-" * 60)
+                print(prompt)
+                print("="*60 + "\n")
+
             resp = self.llm.invoke(prompt)
             intent = resp.content.strip()
             log_step("3️⃣ INTENT_ANALYZER ✅", "Intent analysis complete!", intent)
@@ -646,10 +652,19 @@ If user just says "tasks on date X" without specifying start/planned/submission:
    - ONLY use if user explicitly says "planned date"
    - If you must use it, handle BOTH formats as shown below.
 
-**LOGIC SAFETY CAGE:**
+**LOGIC SAFETY CAGE (CRITICAL):**
 - WHEN using `OR`, YOU MUST wrap the entire `OR` block in parentheses!
-- WRONG: `WHERE col1 = 'val' AND date = 'd1' OR date = 'd2'` (This breaks the col1 filter!)
-- RIGHT: `WHERE col1 = 'val' AND (date = 'd1' OR date = 'd2')`
+- **SAFE DATE PATTERN (Memorize this):**
+  `AND ( (format1 AND date_range) OR (format2 AND date_range) )`
+  
+❌ WRONG (LEAKS DATA):
+`WHERE user = 'Dave' AND fmt1 OR fmt2`
+(This returns Dave's fmt1 tasks PLUS EVERYONE'S fmt2 tasks!)
+
+✅ RIGHT (SECURE):
+`WHERE user = 'Dave' AND ( fmt1 OR fmt2 )`
+
+- NEVER leave `OR` exposed at the root level.
 
 **DEFAULT RULE:**
 - Unless user specifically mentions "planned date", ALWAYS use task_start_date for checklist queries
@@ -665,9 +680,22 @@ For name searches, use ILIKE for case-insensitive:
 WHERE user_name ILIKE '%search_term%'
 """
 
-        prompt = f"""{system_rules}
 
-Database Schema:
+        # Format history for context (simplified for SQL gen)
+        history_text = ""
+        if state.get("chat_history"):
+            history_text = "Previous Context:\n" + "\n".join(
+                [f"{msg['role'].upper()}: {msg['content'][:150]}..." for msg in state["chat_history"][-2:]]
+            ) + "\n(Use this context if user refers to 'it', 'that', 'total', etc.)\n\n"
+
+        prompt = f"""You create PostgreSQL queries based on the given user request and the provided schema. Just return SQL query to be executed.
+Do not return other text or explanation. Don't use markdown or any wrappers.
+
+The schema is provided in the format: 
+TableName: 
+ColumnName (ColumnType) -- ColumnDescription
+
+The schema for the available tables is the following:
 {state['schema_context']}
 
 {state['enum_context']}
@@ -676,24 +704,57 @@ Database Schema:
 
 {state.get('relationship_context', '')}
 
-Intent Analysis:
-{state.get('intent_analysis', 'Not available')}
+=== 🔗 CRITICAL LOGIC RULES ===
+{system_rules}
 
-User Question:
+=== 🔗 JOIN STRATEGY ===
+- **Users to Checklist**: 
+  `JOIN users u ON LOWER(u.user_name) = LOWER(c.name)` 
+  (NEVER join on IDs like `u.id = c.task_id`)
+
+- **Delegation**:
+  `JOIN delegation d ON LOWER(u.user_name) = LOWER(d.delegated_to)`
+
+=== 🚦 STATUS MAPPING (ENUMS) ===
+- "Pending" / "Incomplete" / "Not done" -> `status = 'no'`
+- "Completed" / "Done" / "Finished"     -> `status = 'yes'`
+- "Active" (User)                       -> `status = 'active'`
+- "Active" (Task)                       -> `status = 'no'` (usually means pending)
+
+=== ⚠️ DATE LOGIC STANDARDS (PostgreSQL) ===
+- **ALWAYS CAST TIMESTAMPS TO DATE**: `WHERE task_start_date::date = '2026-02-17'`
+- **"Current Month"**: 
+  `WHERE task_start_date >= DATE_TRUNC('month', CURRENT_DATE) AND task_start_date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'`
+- **SAFE DATE PATTERN (For mixed formats)**:
+  `AND ( (format1 AND date_range) OR (format2 AND date_range) )` - WRAP IN PARENTHESES!
+
+=== INTERPRETING NON-TECHNICAL LANGUAGE ===
+1. **"Report" / "Summary"**:
+   - Use AGGREGATION queries.
+   - Example: SELECT status, COUNT(*) FROM checklist GROUP BY status
+
+2. **"Performance"**:
+   - Compare Completed vs Pending counts.
+
+{history_text}
+
+Generate the PostgreSQL query based on the provided schema and the user request:
 {state['user_question']}
-
-⚠️⚠️⚠️ CRITICAL REMINDERS ⚠️⚠️⚠️
-1. checklist.status uses 'yes'/'no' (NOT 'done'/'completed')
-2. users.status uses 'active'/'inactive'/'on_leave'/'terminated'
-3. checklist.planned_date is TEXT in DD/MM/YYYY format!
-4. Use TO_TIMESTAMP(planned_date, 'DD/MM/YYYY') for date comparisons!
-5. For "not completed on time": 
-   WHERE status = 'no' AND TO_TIMESTAMP(planned_date, 'DD/MM/YYYY') < NOW()
-
-Return ONLY the SQL statement:"""
+"""
 
         try:
             log_step("4️⃣ SQL_GENERATOR", "Sending prompt to LLM...")
+            
+            # --- DEBUG VISIBILITY ---
+            if VERBOSE_MODE:
+                print("\n" + "="*60)
+                print("📜 DEBUG: RAW SQL PROMPT TO LLM")
+                print("-" * 60)
+                # Print only the variable parts or full prompt? Full prompt is best.
+                print(prompt)
+                print("="*60 + "\n")
+            # ------------------------
+
             resp = self.llm.invoke(prompt)
             sql = resp.content.strip()
             
@@ -766,6 +827,13 @@ Return ONLY the SQL statement:"""
             return {"query_result": result}
         except Exception as e:
             log_step("6️⃣ DB_EXECUTOR ❌", f"Query execution failed: {str(e)}")
+            
+            # SELF-HEALING: Invalidate cache if execution failed on a cached query
+            if state.get("cache_hit"):
+                log_step("6️⃣ DB_EXECUTOR 🔄", "Cache hit failed execution. Invalidating cache...")
+                query_cache.invalidate(state["user_question"])
+                return {"error": f"Cached query failed. Cache invalidated. PLEASE RETRY your question to generate new SQL. Error: {str(e)}"}
+            
             return {"error": f"Query execution failed: {str(e)}"}
     
     def _generate_answer(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -805,6 +873,13 @@ FORMATTING RULES:
    - Do NOT say "User does not exist" unless you queried the users table directly.
    - If querying tasks and count is 0, say "No tasks found for this period" or "No tasks completed".
    - Distinguish between "No data found matching criteria" vs "Data doesn't exist".
+8. **FOR REPORT QUERIES**:
+   - If user asked for a report/summary, present a clear breakdown:
+     - **Total Tasks**: X
+     - **Pending**: Y
+     - **Completed**: Z
+     - **Completion Rate**: (Calculate Z/X * 100)%
+   - Use bold headers for these metrics.
 
 Example table format:
 | Name | Department | Count |
@@ -907,10 +982,20 @@ Provide a well-formatted, natural language answer with ALL the data:""")
                     content=question
                 )
             
+            # Fetch chat context (last 2 turns)
+            chat_history = []
+            if session_id:
+                # Get last 10 messages (5 turns), filter to user/assistant pairs
+                msgs = session_service.get_session_messages(session_id, limit=10)
+                # Convert to simple format (role, content) excluding current question
+                for m in msgs[:-1]: # Exclude the just-added user message
+                    chat_history.append({"role": m["role"], "content": m["content"]})
+            
             # Initialize state
             initial_state = {
                 "user_question": question,
                 "session_id": session_id,
+                "chat_history": chat_history,
                 "detected_language": "english",
                 "schema_context": "",
                 "enum_context": "",
@@ -936,7 +1021,8 @@ Provide a well-formatted, natural language answer with ALL the data:""")
                 }
             
             # Run the workflow
-            final_state = self.workflow.invoke(initial_state)
+            config = {"configurable": {"thread_id": session_id}} if session_id else {}
+            final_state = self.workflow.invoke(initial_state, config=config)
             
             # Log pipeline summary
             log_pipeline_summary(final_state)
@@ -1040,17 +1126,42 @@ Provide a well-formatted, natural language answer with ALL the data:""")
                 sample_data = self._get_sample_data_context()
                 relationship_context = self._get_relationship_context()
                 
+                print(f"   Schema Size: {len(schema_context)} chars | Enum Size: {len(enum_context)} chars")
+                
                 # Generate SQL
                 yield json_module.dumps({"type": "status", "message": "Generating SQL query..."}) + "\n"
                 print("🤖 Step 5: Calling LLM to generate SQL...")
                 
-                # Build SQL prompt (simplified for streaming)
+                # Fetch chat history for context
+                chat_history = []
+                if session_id:
+                     chat_history = session_service.get_session_messages(session_id, limit=6)
+                     # Exclude the current user message to keep context clean
+                     chat_history = [msg for msg in chat_history if msg['content'] != question]
+
+                # Build SQL prompt (with history!)
                 sql_prompt = self._build_sql_prompt(
                     question, detected_language, schema_context, 
-                    enum_context, sample_data, relationship_context
+                    enum_context, sample_data, relationship_context,
+                    chat_history=chat_history
                 )
                 
+                if VERBOSE_MODE:
+                    print("\n" + "="*60)
+                    print("📜 DEBUG: STREAMING SQL PROMPT")
+                    print("-" * 60)
+                    print(sql_prompt)
+                    print("="*60 + "\n")
+
                 resp = self.llm.invoke(sql_prompt)
+                
+                if VERBOSE_MODE:
+                    print("\n" + "="*60)
+                    print("📜 DEBUG: RAW LLM RESPONSE")
+                    print("-" * 60)
+                    print(resp.content)
+                    print("="*60 + "\n")
+
                 generated_sql = resp.content.strip()
                 generated_sql = re.sub(r"```sql|```", "", generated_sql).strip()
                 generated_sql = re.sub(r"--.*$", "", generated_sql, flags=re.MULTILINE).strip()
@@ -1107,7 +1218,14 @@ Provide a well-formatted, natural language answer with ALL the data:""")
                     print("No rows returned.")
             except Exception as e:
                 print(f"❌ Query execution FAILED: {str(e)}")
-                yield json_module.dumps({"type": "error", "message": f"Query failed: {str(e)}"}) + "\n"
+                
+                # SELF-HEALING: Invalidate cache if execution failed on a cached query
+                if cached: 
+                    print(f"🔄 Cache hit failed execution. Invalidating cache for question: '{question}'")
+                    query_cache.invalidate(question)
+                    yield json_module.dumps({"type": "error", "message": f"Cached query failed. Cache invalidated. PLEASE RETRY your question to generate new SQL. Error: {str(e)}"}) + "\n"
+                else:
+                    yield json_module.dumps({"type": "error", "message": f"Query failed: {str(e)}"}) + "\n"
                 return
             print("==============================\n")
 
@@ -1195,24 +1313,71 @@ Provide a well-formatted, natural language answer:"""
             if request_id:
                 self.unregister_request(request_id)
     
-    def _build_sql_prompt(self, question, language, schema, enums, samples, relationships):
+    def _build_sql_prompt(self, question, language, schema, enums, samples, relationships, chat_history=None):
         """Build the SQL generation prompt."""
+        
+        # Format history
+        history_text = ""
+        if chat_history:
+            history_text = "=== 🗣️ CONVERSATION HISTORY (CRITICAL FOR 'ISKA') ===\n" + "\n".join(
+                [f"{msg['role'].upper()}: {msg['content']}" for msg in chat_history]
+            ) + "\n"
+
         hinglish_guide = """
-=== HINGLISH TRANSLATION ===
+=== HINGLISH & CONTEXT RULES (CRITICAL) ===
 - "dikhao"/"batao" = show
 - "kitne" = how many
 - "sabhi"/"sab" = all
 - "wale" = those who
 - "pending wale" = WHERE status = 'no'
+- "iska" / "usne" / "unka" / "his" / "her" = **FILTER BY SPECIFIC USER** from Previous Context. 
+  (Analyze 'Previous Context' to find the name like 'Hem Kumar Jagat' and apply specific filter).
 """ if language == "hinglish" else ""
 
         return f"""You are a PostgreSQL SQL generator. Generate READ-ONLY SELECT queries only.
 {hinglish_guide}
 
+{history_text}
+
+=== 🧠 INTENT INTERPRETATION RULES ===
+1. **"Performance Report" / "Report" / "Summary"**:
+   - You MUST generate AGGREGATION metrics (COUNT, SUM).
+   - Output columns: Total Tasks, Pending Count, Completed Count, Completion %.
+   - **DO NOT** return a raw list of tasks unless the user explicitly asks for "List" or "Details".
+
+2. **Contextual Filters ("Iska" / "Him" / "Her")**:
+   - If user refers to a person (e.g., "iska performance", "how is he doing"), look at the **Previous Context**.
+   - Extract the Name (e.g., 'Hem Kumar Jagat') and use it in WHERE clause.
+   - BAD: `WHERE u.status = 'active'` (Too generic)
+   - GOOD: `WHERE LOWER(u.user_name) = LOWER('Hem Kumar Jagat')`
+
+3. **"Kaam" / "Work"**:
+   - Usually refers to `checklist` table.
+
+4. **"Late" vs "Overdue"**:
+   - **"Late"**: Use `checklist.delay` column. Logic: `WHERE c.delay IS NOT NULL`. (Completed but late).
+   - **"Overdue"**: Use date comparison. Logic: `WHERE c.status='no' AND planned_date < NOW()`. (Not done time passed).
+   - If unsure, PREFER `checklist.delay`.
+
 CRITICAL RULES:
 - ONLY SELECT queries allowed
 - checklist.status: 'yes' (completed), 'no' (not completed)
 - users.status: 'active', 'inactive', 'on_leave', 'terminated'
+- **NEVER** use `checklist.description` (it does not exist). Use `checklist.task_description`.
+
+=== 🔗 JOIN STRATEGY (CRITICAL) ===
+- **Users to Checklist**: 
+  `JOIN users u ON LOWER(u.user_name) = LOWER(c.name)` 
+  (NEVER join on IDs like `u.id = c.task_id` - that is WRONG)
+- **Delegation**:
+  `JOIN delegation d ON LOWER(u.user_name) = LOWER(d.delegated_to)`
+
+=== 🚦 STATUS MAPPING (ENUMS) ===
+- "Pending" / "Incomplete" / "Not done" -> `status = 'no'`
+- "Completed" / "Done" / "Finished"     -> `status = 'yes'`
+- "Active" (User)                       -> `status = 'active'`
+- "Active" (Task)                       -> `status = 'no'` (usually means pending)
+
 
 ⚠️ CASE-INSENSITIVE STRING MATCHING:
 ALWAYS use case-insensitive comparisons for text fields like names, usernames, email, etc.
@@ -1224,25 +1389,28 @@ Examples:
 - Finding user "Kavi Singh" or "kavi singh": WHERE LOWER(username) = LOWER('Kavi Singh')
 - Finding names containing "john": WHERE name ILIKE '%john%'
 
-⚠️ CRITICAL DATE HANDLING:
-The column checklist.planned_date stores dates as TEXT in MIXED formats and may have invalid data.
+⚠️ CRITICAL DATE HANDLING (USE CTE):
+Column `planned_date` has mixed formats. You MUST use a CTE to normalize it first.
+DO NOT use complex `OR` logic in WHERE clause.
 
-Create a helper function in your query using a CTE or just filter valid dates:
-
-For date comparisons, first filter only valid date formats, then compare:
-- Valid DD/MM/YYYY: planned_date ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{4}}$'
-- Valid ISO: planned_date ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
-
-Example - Find active users with overdue incomplete tasks (HANDLES ALL DATE FORMATS SAFELY):
-SELECT DISTINCT u.* FROM users u
-JOIN checklist c ON u.id = c.user_id
-WHERE u.status = 'active' 
-AND c.status = 'no' 
-AND (
-    (c.planned_date ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{4}}$' AND TO_TIMESTAMP(c.planned_date, 'DD/MM/YYYY') < NOW())
-    OR 
-    (c.planned_date ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}' AND c.planned_date::timestamp < NOW())
+Example - "Tasks for Dinesh this month":
+```sql
+WITH raw_data AS (
+    SELECT *,
+    CASE
+        WHEN planned_date ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{4}}$' THEN TO_TIMESTAMP(planned_date, 'DD/MM/YYYY')
+        WHEN planned_date ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}' THEN planned_date::timestamp
+        ELSE NULL
+    END as clean_date
+    FROM checklist
 )
+SELECT count(*) FROM raw_data c
+JOIN users u ON LOWER(u.user_name) = LOWER(c.name)
+WHERE LOWER(u.user_name) = LOWER('Dinesh')
+AND clean_date >= DATE_TRUNC('month', CURRENT_DATE)
+AND clean_date < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month';
+```
+(This method is 100% SAFE against data leaks).
 
 This safely handles:
 - DD/MM/YYYY dates (28/11/2025)

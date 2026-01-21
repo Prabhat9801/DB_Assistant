@@ -87,7 +87,8 @@ class SchemaService:
                     col_data = {
                         "type": col['data_type'],
                         "nullable": col['is_nullable'] == 'YES',
-                        "default": col['column_default']
+                        "default": col['column_default'],
+                        "description": col.get('column_description')
                     }
                     
                     # Check for ENUM types (PostgreSQL USER-DEFINED types)
@@ -130,6 +131,27 @@ class SchemaService:
         """Get schema as a dictionary for API responses."""
         return self.get_schema()
     
+    def get_formatted_schema_context(self) -> str:
+        """
+        Generate schema string in the format:
+        Table:
+        Column (Type) -- Description
+        """
+        schema = self.get_schema()
+        lines = []
+        
+        for table_name, table_data in schema.items():
+            if "error" in table_data:
+                continue
+                
+            lines.append(f"{table_name}:")
+            for col_name, col_info in table_data["columns"].items():
+                desc = f" -- {col_info['description']}" if col_info.get('description') else ""
+                lines.append(f"{col_name} ({col_info['type']}){desc}")
+            lines.append("") # Empty line between tables
+            
+        return "\n".join(lines)
+
     def get_schema_context(self) -> str:
         """
         Generate schema context string for LLM prompts.
