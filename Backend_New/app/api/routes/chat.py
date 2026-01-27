@@ -210,6 +210,21 @@ async def stream_agent_response(question: str, session_id: str) -> AsyncGenerato
         
         # Now stream the answer generation with typing effect
         if final_result:
+            # Check if result is an error
+            is_error = any([
+                "Error:" in str(final_result),
+                "psycopg2" in str(final_result),
+                "operator does not exist" in str(final_result),
+                "UndefinedFunction" in str(final_result),
+                "syntax error" in str(final_result).lower()
+            ])
+            
+            if is_error:
+                print(f"[ERROR] Query execution failed: {final_result[:200]}...")
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Query execution failed. Please try rephrasing your question.'})}\n\n"
+                # DON'T cache failed queries!
+                return
+            
             print(f"[DEBUG] Generating natural language answer with streaming...")
             yield f"data: {json.dumps({'type': 'status', 'message': '💬 Generating answer...'})}\n\n"
             
@@ -217,7 +232,7 @@ async def stream_agent_response(question: str, session_id: str) -> AsyncGenerato
             async for word in stream_natural_answer(question, final_result, generated_sql or "", is_sample, total_count):
                 yield f"data: {json.dumps({'type': 'chunk', 'content': word})}\n\n"
             
-            # Cache the successful query
+            # Cache ONLY successful queries
             if generated_sql:
                 query_cache.cache_query(question, generated_sql)
             

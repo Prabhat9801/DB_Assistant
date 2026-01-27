@@ -64,10 +64,50 @@ def list_tables(state: EnhancedState):
     return {"messages": [AIMessage(content=f"Available tables: {tables}")]}
 
 def call_get_schema(state: EnhancedState):
-    """Fetch complete schema with samples"""
+    """Fetch complete schema with samples and add type warnings"""
     tables = ", ".join(settings.ALLOWED_TABLES)
     schema = get_schema_tool.invoke({"table_names": tables})
-    return {"messages": [AIMessage(content=schema)]}
+    
+    # Add critical type casting warnings
+    enhanced_schema = f"""{schema}
+
+⚠️ CRITICAL DATA TYPE WARNINGS:
+═══════════════════════════════════════════════════════════════════════════════
+
+🔴 TEXT DATE COLUMNS (Require ::DATE casting for comparisons):
+   - checklist.planned_date (TEXT) → Use: planned_date::DATE < CURRENT_DATE
+   - delegation.planned_date (TEXT) → Use: planned_date::DATE < CURRENT_DATE
+   
+   ❌ WRONG: WHERE planned_date < CURRENT_DATE
+   ✅ RIGHT: WHERE planned_date::DATE < CURRENT_DATE
+
+🟢 NATIVE DATE/TIMESTAMP COLUMNS (Can compare directly):
+   - checklist.task_start_date (DATE)
+   - checklist.submission_date (TIMESTAMP)
+   - delegation.task_start_date (DATE)
+   - delegation.submission_date (TIMESTAMP)
+
+💡 SAMPLE DATA PATTERNS (Learn from these):
+───────────────────────────────────────────────────────────────────────────────
+Checklist Row 1:
+  submission_date = NULL              → Task is PENDING
+  task_start_date = '2026-01-15'     → Scheduled date
+  status = NULL                       → Don't use (unreliable field)
+
+Checklist Row 2:
+  submission_date = '2026-01-20'     → Task COMPLETED on this date
+  task_start_date = '2026-01-10'     → Was scheduled for this date
+  Late? Yes (10 days late)
+
+Delegation Row 1:
+  status = 'In Progress'              → NOT done yet
+  submission_date = NULL              → Still pending
+  task_start_date = '2026-01-05'     → Overdue (past due)
+═══════════════════════════════════════════════════════════════════════════════
+"""
+    
+    return {"messages": [AIMessage(content=enhanced_schema)]}
+
 
 def store_schema(state: EnhancedState):
     """Store schema in state for both LLMs"""

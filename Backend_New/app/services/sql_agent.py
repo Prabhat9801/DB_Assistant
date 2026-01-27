@@ -225,7 +225,47 @@ You will receive:
 ❌ REJECT if user says "completed" but query is missing submission_date check
 ❌ REJECT if user says "pending" but query is missing submission_date IS NULL
 
-�📅 STEP 2: VERIFY TIMESTAMP FIELD CORRECTNESS & DATE RANGE (CRITICAL!)
+�⚠️ STEP 2: BUSINESS LOGIC VERIFICATION (CRITICAL!)
+──────────────────────────────────────────────────────────────────────────────
+For "completed/not completed on time" queries, VERIFY:
+
+✓ Completed Late Logic:
+  - Must check: submission_date > task_start_date + INTERVAL '1 day'
+  - For delegation: status = 'Done' AND submission_date > expected_date
+
+✓ Overdue Pending Logic:
+  - Must check: submission_date IS NULL AND task_start_date < CURRENT_DATE
+  - For delegation: status <> 'Done' AND task_start_date < CURRENT_DATE
+
+❌ REJECT if query asks for "not on time" but missing EITHER condition
+❌ REJECT if only checks active users without task completion logic
+
+Example CORRECT for "users not on time":
+```sql
+WHERE (
+  (submission_date IS NOT NULL AND submission_date > task_start_date + INTERVAL '1 day')
+  OR
+  (submission_date IS NULL AND task_start_date < CURRENT_DATE)
+)
+```
+
+🔧 STEP 3: TYPE SAFETY CHECK (CRITICAL!)
+──────────────────────────────────────────────────────────────────────────────
+⚠️ Common DATA TYPE ERRORS to REJECT:
+
+❌ REJECT: Comparing TEXT columns with DATE directly
+   Wrong: WHERE planned_date < CURRENT_DATE
+   Error: "operator does not exist: text < date"
+
+✅ CORRECT: Cast TEXT to DATE first
+   Right: WHERE planned_date::DATE < CURRENT_DATE
+   Right: WHERE CAST(planned_date AS DATE) < CURRENT_DATE
+
+Check schema carefully:
+- If column type is TEXT but contains dates → requires ::DATE casting
+- If column type is DATE → can compare directly
+
+📅 STEP 4: VERIFY TIMESTAMP FIELD CORRECTNESS & DATE RANGE
 Current date is {current_date}
 
 ❌ REJECT: WHERE created_at BETWEEN '2025-01-01' AND '2025-02-01'
