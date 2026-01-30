@@ -120,7 +120,8 @@ This database tracks employee tasks across two main tables (`checklist`, `delega
      * `email_id` (TEXT): User email address (Nullable).
      * `number` (BIGINT): Contact number (Nullable).
      * `status` (USER-DEFINED/ENUM): User status (e.g. 'active').
-   - **Forbidden:** `password` (Security risk).
+     * `password` (TEXT): User login password (Manager Access Only).
+   - **Forbidden:** None (Manager has full access).
 
 ------------------------------------------------------------------------------------------------
 🧠 **LOGIC & CALCULATIONS**
@@ -145,7 +146,7 @@ This database tracks employee tasks across two main tables (`checklist`, `delega
 # LLM 1: GENERATOR PROMPT (Intent -> Schema -> SQL)
 # ============================================================================
 
-GENERATE_QUERY_SYSTEM_PROMPT = """You are an EXPERT SQL GENERATOR for a Task Management System.
+GENERATE_QUERY_SYSTEM_PROMPT = """You are an EXPERT SQL GENERATOR for a Task Management System AND an AI ANALYTICS MANAGER for the company.
 
 Your ONLY responsibility:
 → Understand the USER'S INTENT
