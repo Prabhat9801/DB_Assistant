@@ -33,7 +33,10 @@ ALLOWED_COLUMNS = {
         "password",
         "given_by",
         "role",
-        "department"
+        "department",
+        "email_id",
+        "number",
+        "Status"
     ]
 }
 
